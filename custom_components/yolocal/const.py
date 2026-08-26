@@ -14,7 +14,11 @@ CONF_NET_ID = "net_id"
 # Default ports
 DEFAULT_HTTP_PORT = 1080
 DEFAULT_MQTT_PORT = 18080
-UPDATE_INTERVAL = timedelta(minutes=5)
+
+# The integration is MQTT-first.  This timer evaluates cached liveness only;
+# it does NOT poll every device.  HTTP getState is queued only for devices that
+# are stale/suspect or need command confirmation.
+HEALTH_EVALUATION_INTERVAL = timedelta(minutes=1)
 DEVICE_DISCOVERY_INTERVAL = timedelta(minutes=1)
 
 # API endpoints

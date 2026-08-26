@@ -7,16 +7,15 @@ from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import Entity
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity import Entity
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
-from homeassistant.util import dt as dt_util
 
 from .api import Device
 from .const import DOMAIN
-from .coordinator import STALE_REPORT_AGE, YoLocalCoordinator
+from .coordinator import YoLocalCoordinator
 
 EntityBuilder = Callable[[YoLocalCoordinator, Device], Iterable[Entity]]
 
@@ -87,7 +86,6 @@ class YoLocalEntity(CoordinatorEntity[YoLocalCoordinator]):
             model = f"{self._device.model} ({self._device.display_type})"
         else:
             model = self._device.display_type
-
         return DeviceInfo(
             identifiers={(DOMAIN, self._device.device_id)},
             name=self._device.name,
@@ -103,7 +101,7 @@ class YoLocalEntity(CoordinatorEntity[YoLocalCoordinator]):
 
     @property
     def nested_device_state(self) -> dict[str, Any]:
-        """Return the nested `state` object when available."""
+        """Return the nested ``state`` object when available."""
         state = self.device_state.get("state")
         if isinstance(state, dict):
             return state
@@ -129,19 +127,11 @@ class YoLocalEntity(CoordinatorEntity[YoLocalCoordinator]):
 
     @property
     def available(self) -> bool:
-        """Return True if entity is available."""
-        state = self.device_state
-        if not state.get("online", True):
-            return False
+        """Return the derived device availability decision.
 
-        report_at = state.get("lastReportedAt")
-        if report_at:
-            try:
-                last_report = dt_util.parse_datetime(report_at)
-                if last_report is not None:
-                    if dt_util.utcnow() - last_report > STALE_REPORT_AGE:
-                        return False
-            except Exception:
-                pass
-
-        return True
+        Availability is intentionally independent from a single raw ``online``
+        field or one transient getState failure.  The coordinator's availability
+        manager combines positive MQTT/HTTP liveness with spaced verification
+        failures before declaring a device unavailable.
+        """
+        return self.coordinator.is_device_available(self._device.device_id)

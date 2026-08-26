@@ -5,18 +5,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 from collections.abc import Callable, Coroutine
-from datetime import timedelta
 from time import monotonic
 from typing import Any
 
 import aiohttp
-
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
-from homeassistant.util import dt as dt_util
 
 from .api import (
     ApiError,
@@ -26,28 +24,38 @@ from .api import (
     YoLinkClient,
     YoLinkMQTTClient,
 )
+from .availability import AvailabilityManager
 from .const import (
     DEVICE_DISCOVERY_INTERVAL,
     DOMAIN,
-    UPDATE_INTERVAL,
+    HEALTH_EVALUATION_INTERVAL,
 )
 
 _LOGGER = logging.getLogger(__name__)
 type DeviceRegistryListener = Callable[[list[Device], list[Device]], None]
+
 TRANSIENT_DEVICE_UNREACHABLE = "000201"
-STALE_REPORT_AGE = timedelta(hours=12)
 SET_STATE_TRANSPORT_RETRY_DELAY = 2.0
+SET_STATE_DEVICE_RETRY_DELAY = 2.0
+SET_STATE_ATTEMPTS = 2
 HUB_HEALTH_FAILURE_THRESHOLD = 2
 MQTT_DUPLICATE_WINDOW = 300.0
 MQTT_DUPLICATE_CACHE_LIMIT = 256
+BOOTSTRAP_CONCURRENCY = 2
+DEVICE_IO_TIMEOUT = 10.0
+VERIFY_JITTER_MIN = 0.25
+VERIFY_JITTER_MAX = 1.25
+COMMAND_CONFIRM_DELAY = 2.0
 
 
 class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
     """Coordinator for YoLink Local devices.
 
-    Manages MQTT subscription for real-time updates and provides
-    device state to entities. Falls back to HTTP polling every 5 minutes
-    to ensure state stays current if MQTT events are missed.
+    MQTT is the normal authoritative state path.  HTTP getState is used for the
+    initial bootstrap and for targeted verification only when a device becomes
+    stale/suspect or a command needs confirmation.  A transient ``000201`` is
+    therefore treated as one failed request, not as proof that the device is
+    offline.
     """
 
     def __init__(
@@ -73,15 +81,26 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self._config_entry_id = config_entry_id
         self._net_id = net_id
         self._mqtt_port = mqtt_port
+
         self._mqtt_clients: dict[str, YoLinkMQTTClient] = {}
         self._devices: dict[str, Device] = {}
         self._states: dict[str, dict[str, Any]] = {}
+        self._availability = AvailabilityManager()
+
         self._reconnect_task: asyncio.Task[None] | None = None
         self._discovery_task: asyncio.Task[None] | None = None
-        self._state_refresh_task: asyncio.Task[None] | None = None
+        self._health_task: asyncio.Task[None] | None = None
+        self._verification_task: asyncio.Task[None] | None = None
+        self._command_confirmation_tasks: dict[str, asyncio.Task[Any]] = {}
+
+        self._verification_queue: asyncio.Queue[tuple[str, str, bool]] = asyncio.Queue()
+        self._queued_verifications: set[str] = set()
+        self._device_io_lock = asyncio.Lock()
+
         self._device_registry_listeners: list[DeviceRegistryListener] = []
         self._shutdown = False
         self._hub_health_failures = 0
+        self._hub_api_healthy = True
         self._recent_mqtt_events: dict[str, float] = {}
 
     @property
@@ -111,129 +130,201 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             return self.hass.async_create_background_task(coro, name)
         return self.hass.async_create_task(coro)
 
+    def _register_device_health(self, device: Device) -> None:
+        """Ensure availability metadata exists for a discovered device."""
+        self._availability.ensure_device(
+            device.device_id,
+            name=device.name,
+            device_type=device.device_type,
+            model=device.model,
+        )
+
     async def _async_setup(self) -> None:
-        """Set up the coordinator: fetch devices and connect MQTT."""
+        """Set up the coordinator: fetch devices and start MQTT/background work."""
         devices = await self._client.get_devices()
         self._devices = {d.device_id: d for d in devices}
+        for device in devices:
+            self._register_device_health(device)
         self._remove_stale_registry_devices(set(self._devices))
 
+        # MQTT connects in the background exactly as in the upstream fork so HA
+        # startup is not blocked on broker connection/reconnection.
         self._on_mqtt_disconnect()
-
         if self._discovery_task is None:
             self._discovery_task = self._create_background_task(
                 self._async_device_discovery_loop(),
                 "yolocal_device_discovery",
             )
-        if self._state_refresh_task is None:
-            self._state_refresh_task = self._create_background_task(
-                self._async_state_refresh_loop(),
-                "yolocal_state_refresh",
+        if self._health_task is None:
+            self._health_task = self._create_background_task(
+                self._async_health_loop(),
+                "yolocal_health",
             )
-
-    async def _fetch_all_states(self) -> None:
-        """Fetch current state for all devices via HTTP API."""
-        self._states = await self._async_update_data()
+        if self._verification_task is None:
+            self._verification_task = self._create_background_task(
+                self._async_verification_worker(),
+                "yolocal_verification",
+            )
 
     async def _async_update_data(self) -> dict[str, dict[str, Any]]:
-        """Refresh device state from the hub and merge it into the cache."""
-        results = await asyncio.gather(
-            *(
-                self._async_refresh_device_state(
-                    device_id,
-                    device,
-                )
-                for device_id, device in self._devices.items()
-            )
-        )
+        """Bootstrap state for devices that do not yet have a valid cached state.
 
-        refreshed_states = self._states.copy()
-        for device_id, incoming_state, unreachable in results:
-            current_state = refreshed_states.get(device_id, {})
-            if unreachable:
-                refreshed_states[device_id] = self._mark_unreachable(current_state)
-            elif incoming_state is not None:
-                refreshed_states[device_id] = self._merge_state_payload(
-                    current_state,
-                    incoming_state,
+        The old implementation queried every device concurrently every five
+        minutes.  This method now runs as the coordinator's startup bootstrap
+        and only queries devices that lack state.  Bootstrap concurrency is
+        deliberately bounded to two requests and each device gets one attempt.
+        """
+        missing = [
+            (device_id, device)
+            for device_id, device in self._devices.items()
+            if not self._states.get(device_id)
+        ]
+        if not missing:
+            return self._states.copy()
+
+        semaphore = asyncio.Semaphore(BOOTSTRAP_CONCURRENCY)
+
+        async def fetch_one(
+            device_id: str, device: Device
+        ) -> tuple[str, dict[str, Any] | None]:
+            async with semaphore:
+                try:
+                    async with asyncio.timeout(DEVICE_IO_TIMEOUT):
+                        state = await self._client.get_state(device)
+                except ApiError as err:
+                    if err.code == TRANSIENT_DEVICE_UNREACHABLE:
+                        self._availability.record_device_unreachable(
+                            device_id,
+                            error_code=err.code,
+                            error=str(err),
+                            source="bootstrap",
+                        )
+                        _LOGGER.debug(
+                            "Initial state temporarily unavailable for %s: %s",
+                            device.name,
+                            err,
+                        )
+                        return device_id, None
+                    _LOGGER.warning(
+                        "Failed to get initial state for %s: %s",
+                        device.name,
+                        err,
+                    )
+                    return device_id, None
+                except (aiohttp.ClientError, TimeoutError) as err:
+                    _LOGGER.warning(
+                        "Transport failure getting initial state for %s: %s",
+                        device.name,
+                        err,
+                    )
+                    return device_id, None
+                except Exception:
+                    _LOGGER.warning(
+                        "Failed to get initial state for %s",
+                        device.name,
+                        exc_info=True,
+                    )
+                    return device_id, None
+
+                normalized = self._normalize_http_state(state)
+                self._availability.record_http_success(
+                    device_id,
+                    reported_at=self._reported_at(normalized),
+                    raw_online=self._raw_online(normalized),
+                    source="bootstrap",
                 )
+                return device_id, normalized
+
+        results = await asyncio.gather(*(fetch_one(*item) for item in missing))
+        refreshed_states = self._states.copy()
+        for device_id, incoming_state in results:
+            if incoming_state is None:
+                continue
+            refreshed_states[device_id] = self._with_derived_online(
+                device_id,
+                self._merge_state_payload(
+                    refreshed_states.get(device_id, {}),
+                    incoming_state,
+                ),
+            )
 
         self._states = refreshed_states
         return refreshed_states.copy()
 
-    async def _async_refresh_device_state(
-        self,
-        device_id: str,
-        device: Device,
-    ) -> tuple[str, dict[str, Any] | None, bool]:
-        """Fetch one device state and return the HTTP payload to merge."""
-        try:
-            state = await self._async_get_state_with_retry(device)
-            if state is None:
-                return device_id, None, True
-        except Exception:
-            _LOGGER.warning(
-                "Failed to refresh state for %s",
-                device.name,
-                exc_info=True,
-            )
-            return device_id, None, False
-
-        return device_id, self._normalize_http_state(state), False
-
-    def _state_is_stale(self, state: dict[str, Any]) -> bool:
-        """Return True when a state has not reported within the stale window."""
-        report_at = state.get("lastReportedAt")
-        if not report_at:
-            return False
-        try:
-            last_report = dt_util.parse_datetime(report_at)
-        except (TypeError, ValueError):
-            return False
-        return last_report is not None and dt_util.utcnow() - last_report > STALE_REPORT_AGE
+    async def _fetch_all_states(self) -> None:
+        """Compatibility helper: bootstrap only states that are still missing."""
+        self._states = await self._async_update_data()
 
     async def _async_get_state_with_retry(
         self,
         device: Device,
         attempts: int = 3,
     ) -> dict[str, Any] | None:
-        """Fetch device state, tolerating transient hub-to-device failures."""
+        """Compatibility helper for targeted reads without poisoning availability.
+
+        This method is intentionally *not* used by a periodic all-device loop.
+        Repeated ``000201`` returns ``None`` and leaves cached state untouched.
+        """
         for attempt in range(1, attempts + 1):
             try:
-                return await self._client.get_state(device)
+                return await self._async_get_state_runtime(device)
             except ApiError as err:
                 if err.code != TRANSIENT_DEVICE_UNREACHABLE:
                     raise
                 if attempt < attempts:
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(SET_STATE_DEVICE_RETRY_DELAY)
                     continue
-                _LOGGER.debug(
-                    "Device state temporarily unavailable for %s: %s",
-                    device.name,
-                    err,
-                )
                 return None
         return None
+
+    async def _async_get_state_runtime(self, device: Device) -> dict[str, Any]:
+        """Perform one serialized runtime getState request."""
+        async with self._device_io_lock:
+            async with asyncio.timeout(DEVICE_IO_TIMEOUT):
+                return await self._client.get_state(device)
+
+    async def _async_set_state_runtime(
+        self, device: Device, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Perform one serialized runtime setState request."""
+        async with self._device_io_lock:
+            async with asyncio.timeout(DEVICE_IO_TIMEOUT):
+                return await self._client.set_state(device, params)
 
     async def _async_set_state_with_retry(
         self,
         device: Device,
         params: dict[str, Any],
-        attempts: int = 3,
+        attempts: int = SET_STATE_ATTEMPTS,
     ) -> dict[str, Any]:
-        """Set device state, retrying transient hub-to-device failures."""
+        """Set device state, retrying transient 000201 without changing availability."""
         for attempt in range(1, attempts + 1):
             try:
-                return await self._client.set_state(device, params)
+                result = await self._async_set_state_runtime(device, params)
+                self._mark_hub_api_available()
+                availability_changed = self._availability.record_command_success(
+                    device.device_id
+                )
+                self._notify_if_ha_availability_changed(
+                    device.device_id, availability_changed
+                )
+                return result
             except ApiError as err:
                 if err.code != TRANSIENT_DEVICE_UNREACHABLE:
                     raise
                 if attempt < attempts:
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(SET_STATE_DEVICE_RETRY_DELAY)
                     continue
-                self._update_device_state(
+                availability_changed = self._availability.record_command_failure(
                     device.device_id,
-                    {**self._states.get(device.device_id, {}), "online": False},
+                    error_code=err.code,
+                    error=str(err),
                 )
+                self._notify_if_ha_availability_changed(
+                    device.device_id, availability_changed
+                )
+                # Important: command failure is surfaced to the caller, but the
+                # cached device state is NOT changed to online:false.
                 raise
         raise RuntimeError("Failed to set device state")
 
@@ -245,17 +336,55 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         """Send a command, recovering one ambiguous transport failure."""
         try:
             return await self._async_set_state_with_retry(device, params)
-        except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as err:
+        except (aiohttp.ClientConnectionError, TimeoutError) as err:
+            self._mark_hub_api_failure(err)
+            availability_changed = self._availability.record_transport_error(
+                device.device_id,
+                error=str(err),
+                source="command_transport",
+            )
+            self._notify_if_ha_availability_changed(
+                device.device_id, availability_changed
+            )
             if hasattr(self._client, "switch_host"):
                 self._client.switch_host()
             await asyncio.sleep(SET_STATE_TRANSPORT_RETRY_DELAY)
+
+            # The command response may have been lost even if the command
+            # reached the device.  Verify before issuing a duplicate command.
             try:
-                state = await self._async_get_state_with_retry(device, attempts=1)
-                if state is not None:
-                    normalized_state = self._normalize_http_state(state)
-                    self._update_device_state(device.device_id, normalized_state)
-                    if self._state_matches_command(normalized_state, params):
-                        return {}
+                state = await self._async_get_state_runtime(device)
+                normalized_state = self._normalize_http_state(state)
+                self._availability.record_http_success(
+                    device.device_id,
+                    reported_at=self._reported_at(normalized_state),
+                    raw_online=self._raw_online(normalized_state),
+                    source="command_transport_verify",
+                )
+                self._update_device_state(
+                    device.device_id,
+                    self._merge_state_payload(
+                        self._states.get(device.device_id, {}),
+                        normalized_state,
+                    ),
+                )
+                if self._state_matches_command(normalized_state, params):
+                    return {}
+            except ApiError as verify_err:
+                if verify_err.code == TRANSIENT_DEVICE_UNREACHABLE:
+                    changed = self._availability.record_device_unreachable(
+                        device.device_id,
+                        error_code=verify_err.code,
+                        error=str(verify_err),
+                        source="command_transport_verify",
+                    )
+                    self._notify_if_ha_availability_changed(device.device_id, changed)
+                else:
+                    _LOGGER.debug(
+                        "API error verifying state after transport error for %s",
+                        device.name,
+                        exc_info=True,
+                    )
             except Exception:
                 _LOGGER.debug(
                     "Failed to verify state after transport error for %s",
@@ -264,8 +393,10 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                 )
 
             try:
-                return await self._async_set_state_with_retry(device, params, attempts=1)
-            except (aiohttp.ClientConnectionError, asyncio.TimeoutError):
+                return await self._async_set_state_with_retry(
+                    device, params, attempts=1
+                )
+            except (aiohttp.ClientConnectionError, TimeoutError):
                 raise err
 
     def _state_matches_command(
@@ -305,15 +436,21 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
     async def async_shutdown(self) -> None:
         """Shut down the coordinator."""
         self._shutdown = True
-        if self._discovery_task:
-            self._discovery_task.cancel()
-            self._discovery_task = None
-        if self._state_refresh_task:
-            self._state_refresh_task.cancel()
-            self._state_refresh_task = None
-        if self._reconnect_task:
-            self._reconnect_task.cancel()
-            self._reconnect_task = None
+        for task_name in (
+            "_discovery_task",
+            "_health_task",
+            "_verification_task",
+            "_reconnect_task",
+        ):
+            task = getattr(self, task_name)
+            if task:
+                task.cancel()
+                setattr(self, task_name, None)
+
+        for task in list(self._command_confirmation_tasks.values()):
+            task.cancel()
+        self._command_confirmation_tasks.clear()
+
         for mqtt_client in list(self._mqtt_clients.values()):
             await mqtt_client.disconnect()
         self._mqtt_clients.clear()
@@ -335,7 +472,6 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                 )
             else:
                 connected_hosts.append(host)
-
         if not connected_hosts:
             if last_error is not None:
                 raise last_error
@@ -357,7 +493,6 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             token = await self._token_manager.get_token_for_host(host)
         else:
             token = await self._token_manager.get_token()
-
         mqtt_client = YoLinkMQTTClient(
             host=host,
             net_id=self._net_id,
@@ -367,11 +502,13 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         )
         mqtt_client.subscribe(self._on_device_event)
         mqtt_client.on_disconnect(lambda host=host: self._on_mqtt_disconnect(host))
-
         try:
             await mqtt_client.connect()
             self._mqtt_clients[host] = mqtt_client
             _LOGGER.info("Connected to YoLink MQTT broker at %s", host)
+            # If HTTP was also degraded, MQTT reconnect can restore the Local
+            # path without waiting for the next discovery cycle.
+            self.async_set_updated_data(self._states.copy())
         except Exception:
             try:
                 await mqtt_client.disconnect()
@@ -399,10 +536,39 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             return
 
         event_data = event.data if isinstance(event.data, dict) else {}
+        raw_online = self._raw_online(event_data)
+        reported_at = self._reported_at(event_data)
+        meaningful_payload_keys = set(event_data) - {
+            "online", "reportAt", "lastReportedAt"
+        }
+        newer_report = self._availability.report_timestamp_is_newer(
+            device_id, reported_at
+        )
+
+        if raw_online is False and not meaningful_payload_keys and not newer_report:
+            # An offline-only hub hint is evidence to verify, not evidence that
+            # the LoRa device itself is gone.  A newer device report timestamp
+            # or an actual state payload still counts as positive liveness.
+            self._availability.record_offline_hint(
+                device_id,
+                source="mqtt",
+            )
+        else:
+            # A non-duplicate device report/state payload is positive liveness.
+            # It immediately clears suspect/unavailable status.
+            self._availability.record_mqtt_event(
+                device_id,
+                reported_at=reported_at,
+                raw_online=raw_online,
+            )
+
         normalized_event = self._normalize_mqtt_event(device, event_data)
         self._update_device_state(
             device_id,
-            self._merge_state_payload(self._states.get(device_id, {}), normalized_event),
+            self._merge_state_payload(
+                self._states.get(device_id, {}),
+                normalized_event,
+            ),
         )
 
     def _is_duplicate_mqtt_event(self, event: DeviceEvent) -> bool:
@@ -412,7 +578,6 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         for key, seen_at in list(self._recent_mqtt_events.items()):
             if seen_at < cutoff:
                 self._recent_mqtt_events.pop(key, None)
-
         event_key = self._mqtt_event_key(event)
         if event_key in self._recent_mqtt_events:
             self._recent_mqtt_events[event_key] = now
@@ -434,24 +599,54 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
 
     def _update_device_state(self, device_id: str, state: dict[str, Any]) -> None:
         """Store updated device state and notify listeners."""
-        self._states[device_id] = state
+        self._states[device_id] = self._with_derived_online(device_id, state)
         self.async_set_updated_data(self._states.copy())
+
+    def _with_derived_online(
+        self, device_id: str, state: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Return state with HA-facing online derived from the health manager."""
+        derived = dict(state)
+        derived["online"] = self.is_device_available(device_id)
+        return derived
+
+    def _sync_derived_online(self, device_id: str) -> bool:
+        """Synchronize cached online with derived availability."""
+        state = self._states.get(device_id)
+        if not state:
+            return False
+        desired = self.is_device_available(device_id)
+        if state.get("online") is desired:
+            return False
+        self._states[device_id] = {**state, "online": desired}
+        return True
+
+    def _notify_if_ha_availability_changed(
+        self, device_id: str, status_changed: bool
+    ) -> None:
+        """Notify HA only when the derived availability actually changes."""
+        if not status_changed:
+            return
+        if self._sync_derived_online(device_id):
+            self.async_set_updated_data(self._states.copy())
 
     def _normalize_http_state(self, state: dict[str, Any]) -> dict[str, Any]:
         """Normalize an HTTP getState payload to the coordinator's canonical shape."""
         normalized_state = self._sanitize_state_payload(state)
-        normalized_state.setdefault("online", True)
         if normalized_state.get("reportAt") and "lastReportedAt" not in normalized_state:
             normalized_state["lastReportedAt"] = normalized_state["reportAt"]
         return normalized_state
 
-    def _mark_unreachable(self, state: dict[str, Any]) -> dict[str, Any]:
-        """Mark a device unavailable after repeated read-only getState failures."""
-        if not state:
-            return {"online": False}
-        if state.get("online") is False:
-            return state
-        return {**state, "online": False}
+    @staticmethod
+    def _reported_at(state: dict[str, Any]) -> Any:
+        """Return the best report timestamp exposed by a payload."""
+        return state.get("lastReportedAt") or state.get("reportAt")
+
+    @staticmethod
+    def _raw_online(state: dict[str, Any]) -> bool | None:
+        """Return a raw boolean online hint, if present."""
+        value = state.get("online")
+        return value if isinstance(value, bool) else None
 
     def _normalize_mqtt_event(
         self,
@@ -464,14 +659,12 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         for key in ("online", "reportAt", "lastReportedAt"):
             if key in event_data:
                 normalized[key] = event_data[key]
-
         nested_state: dict[str, Any] = {}
         event_state = event_data.get("state")
         if isinstance(event_state, dict):
             nested_state.update(event_state)
         elif event_state is not None:
             nested_state["state"] = event_state
-
         for key, value in event_data.items():
             if key in {"state", "online", "reportAt", "lastReportedAt"}:
                 continue
@@ -485,7 +678,6 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
 
         if nested_state:
             normalized["state"] = nested_state
-
         return self._sanitize_state_payload(normalized)
 
     def _merge_state_payload(
@@ -503,7 +695,6 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             merged_state["state"] = self._sanitize_nested_state(merged_nested_state)
         elif merged_nested_state is not None:
             merged_state["state"] = merged_nested_state
-        self._apply_event_availability(existing_state, incoming_state, merged_state)
         return merged_state
 
     def _merge_device_state(
@@ -527,20 +718,6 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         """Merge a raw THSensor event into the cached state shape."""
         return self._merge_device_state(device_id, event_data)
 
-    def _apply_event_availability(
-        self,
-        existing_state: dict[str, Any],
-        event_data: dict[str, Any],
-        merged_state: dict[str, Any],
-    ) -> None:
-        """Mark a device online again when a fresh report arrives."""
-        if "online" in event_data:
-            return
-
-        reported_at = event_data.get("lastReportedAt")
-        if reported_at and reported_at != existing_state.get("lastReportedAt"):
-            merged_state["online"] = True
-
     def _sanitize_state_payload(self, state: dict[str, Any]) -> dict[str, Any]:
         """Remove inaccurate fields from a state payload."""
         sanitized = dict(state)
@@ -561,7 +738,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         existing_state: Any,
         event_state: Any,
     ) -> Any | None:
-        """Merge the payload's nested `state` field while preserving prior details."""
+        """Merge the payload's nested ``state`` field while preserving details."""
         if event_state is None:
             return None
         if isinstance(event_state, dict):
@@ -579,6 +756,9 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             return
         if host is not None:
             self._mqtt_clients.pop(host, None)
+            # Re-evaluate entity availability if the last working MQTT path
+            # disappeared while the HTTP path is also unhealthy.
+            self.async_set_updated_data(self._states.copy())
         if self._reconnect_task and not self._reconnect_task.done():
             return
         self._reconnect_task = self.hass.async_create_task(self._async_reconnect_mqtt())
@@ -592,7 +772,6 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             ]
             if not missing_hosts:
                 return
-
             for host in missing_hosts:
                 try:
                     await self._connect_mqtt_host(host)
@@ -605,7 +784,6 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
 
             if all(host in self._mqtt_clients for host in self._mqtt_hosts):
                 return
-
             await asyncio.sleep(backoff_seconds)
             backoff_seconds = min(backoff_seconds * 2, 300)
 
@@ -616,17 +794,138 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             await asyncio.sleep(interval)
             await self._async_refresh_devices()
 
-    async def _async_state_refresh_loop(self) -> None:
-        """Periodically poll getState independent of HA coordinator scheduling."""
-        interval = UPDATE_INTERVAL.total_seconds()
+    async def _async_health_loop(self) -> None:
+        """Evaluate liveness in memory and queue targeted verification when needed."""
+        interval = HEALTH_EVALUATION_INTERVAL.total_seconds()
         while not self._shutdown:
             await asyncio.sleep(interval)
+            notify = False
+            for device_id in list(self._devices):
+                before_available = self._availability.is_available(device_id)
+                evaluation = self._availability.evaluate(device_id)
+                after_available = self._availability.is_available(device_id)
+                if before_available != after_available:
+                    self._sync_derived_online(device_id)
+                    notify = True
+                if evaluation.should_verify:
+                    self._queue_verification(
+                        device_id,
+                        reason=evaluation.reason or "health_check",
+                    )
+            if notify:
+                self.async_set_updated_data(self._states.copy())
+
+    @callback
+    def _queue_verification(
+        self,
+        device_id: str,
+        *,
+        reason: str,
+        force: bool = False,
+    ) -> None:
+        """Queue one verification without allowing duplicate queued requests."""
+        if self._shutdown or device_id not in self._devices:
+            return
+        if device_id in self._queued_verifications:
+            return
+        self._queued_verifications.add(device_id)
+        self._availability.note_verification_request(device_id)
+        self._verification_queue.put_nowait((device_id, reason, force))
+
+    async def _async_verification_worker(self) -> None:
+        """Run targeted getState verification serially with jitter."""
+        while not self._shutdown:
+            device_id, reason, force = await self._verification_queue.get()
             try:
-                refreshed_states = await self._async_update_data()
-            except Exception:
-                _LOGGER.warning("Failed to refresh YoLink device states", exc_info=True)
-                continue
-            self.async_set_updated_data(refreshed_states)
+                device = self._devices.get(device_id)
+                if device is None:
+                    continue
+
+                if not force and not self._availability.should_verify(device_id):
+                    continue
+
+                if not force:
+                    await asyncio.sleep(random.uniform(VERIFY_JITTER_MIN, VERIFY_JITTER_MAX))
+                    # A fresh MQTT report may have arrived while the request was
+                    # queued or during jitter.  Re-check before touching LoRa.
+                    if not self._availability.should_verify(device_id):
+                        continue
+
+                try:
+                    state = await self._async_get_state_runtime(device)
+                except ApiError as err:
+                    if err.code == TRANSIENT_DEVICE_UNREACHABLE:
+                        before_available = self._availability.is_available(device_id)
+                        self._availability.record_device_unreachable(
+                            device_id,
+                            error_code=err.code,
+                            error=str(err),
+                            source="verification",
+                        )
+                        after_available = self._availability.is_available(device_id)
+                        if before_available != after_available:
+                            self._sync_derived_online(device_id)
+                            self.async_set_updated_data(self._states.copy())
+                        _LOGGER.debug(
+                            "Verification temporarily could not reach %s (%s): %s",
+                            device.name,
+                            reason,
+                            err,
+                        )
+                    else:
+                        _LOGGER.warning(
+                            "Verification API error for %s (%s): %s",
+                            device.name,
+                            reason,
+                            err,
+                        )
+                    continue
+                except (aiohttp.ClientError, TimeoutError) as err:
+                    self._availability.record_transport_error(
+                        device_id,
+                        error=str(err),
+                        source="verification_transport",
+                    )
+                    self._mark_hub_api_failure(err)
+                    _LOGGER.warning(
+                        "Verification transport error for %s (%s): %s",
+                        device.name,
+                        reason,
+                        err,
+                    )
+                    continue
+                except Exception as err:
+                    self._availability.record_transport_error(
+                        device_id,
+                        error=str(err),
+                        source="verification_error",
+                    )
+                    _LOGGER.warning(
+                        "Verification failed for %s (%s)",
+                        device.name,
+                        reason,
+                        exc_info=True,
+                    )
+                    continue
+
+                self._mark_hub_api_available()
+                normalized = self._normalize_http_state(state)
+                self._availability.record_http_success(
+                    device_id,
+                    reported_at=self._reported_at(normalized),
+                    raw_online=self._raw_online(normalized),
+                    source="verification",
+                )
+                self._update_device_state(
+                    device_id,
+                    self._merge_state_payload(
+                        self._states.get(device_id, {}),
+                        normalized,
+                    ),
+                )
+            finally:
+                self._queued_verifications.discard(device_id)
+                self._verification_queue.task_done()
 
     async def _async_refresh_devices(self) -> bool:
         """Refresh the device registry and notify listeners if membership changed."""
@@ -636,9 +935,11 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             _LOGGER.warning("Failed to refresh device list", exc_info=True)
             self._mark_hub_api_failure(err)
             return False
-
         self._mark_hub_api_available()
         new_devices = {device.device_id: device for device in devices}
+        for device in devices:
+            self._register_device_health(device)
+
         if set(new_devices) == set(self._devices):
             self._devices = new_devices
             return False
@@ -654,15 +955,45 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             removed_ids,
         )
         self._devices = new_devices
-
         for device_id in removed_ids:
             self._states.pop(device_id, None)
+            self._availability.remove_device(device_id)
+            self._queued_verifications.discard(device_id)
             self._remove_device_from_registry(device_id)
 
+        # New devices are uncommon, so one serialized state read is appropriate
+        # here.  A transient 000201 leaves the new device unknown and the health
+        # loop will retry later rather than falsely declaring it offline.
         for device in added_devices:
             try:
-                state = await self._client.get_state(device)
-                self._states[device.device_id] = self._normalize_http_state(state)
+                state = await self._async_get_state_runtime(device)
+                normalized = self._normalize_http_state(state)
+                self._availability.record_http_success(
+                    device.device_id,
+                    reported_at=self._reported_at(normalized),
+                    raw_online=self._raw_online(normalized),
+                    source="discovery",
+                )
+                self._states[device.device_id] = self._with_derived_online(
+                    device.device_id,
+                    normalized,
+                )
+            except ApiError as err:
+                if err.code == TRANSIENT_DEVICE_UNREACHABLE:
+                    self._availability.record_device_unreachable(
+                        device.device_id,
+                        error_code=err.code,
+                        error=str(err),
+                        source="discovery",
+                    )
+                    _LOGGER.debug(
+                        "New device state temporarily unavailable for %s: %s",
+                        device.name,
+                        err,
+                    )
+                else:
+                    _LOGGER.warning("Failed to get initial state for %s", device.name)
+                self._states[device.device_id] = {}
             except Exception:
                 _LOGGER.warning("Failed to get initial state for %s", device.name)
                 self._states[device.device_id] = {}
@@ -677,16 +1008,28 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         return True
 
     def _mark_hub_api_available(self) -> None:
-        """Clear coordinator update error after a successful hub API call."""
+        """Mark the HTTP/API transport healthy without changing device health."""
+        was_healthy = self._hub_api_healthy
         self._hub_health_failures = 0
+        self._hub_api_healthy = True
         if not self.last_update_success:
+            self.async_set_updated_data(self._states.copy())
+        elif not was_healthy:
             self.async_set_updated_data(self._states.copy())
 
     def _mark_hub_api_failure(self, err: Exception) -> None:
-        """Mark coordinator unhealthy only after repeated hub API failures."""
+        """Mark HTTP/API transport degraded only after repeated transport failures."""
         self._hub_health_failures += 1
         if self._hub_health_failures >= HUB_HEALTH_FAILURE_THRESHOLD:
+            was_healthy = self._hub_api_healthy
+            self._hub_api_healthy = False
             self.async_set_update_error(err)
+            if was_healthy:
+                self.async_set_updated_data(self._states.copy())
+
+    def _has_live_transport(self) -> bool:
+        """Return True while either Local transport path is currently usable."""
+        return bool(self._mqtt_clients) or self._hub_api_healthy
 
     def _remove_device_from_registry(self, device_id: str) -> None:
         """Remove a deleted device from the HA device registry."""
@@ -706,7 +1049,6 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             )
         else:
             device_entries = list(getattr(registry, "devices", {}).values())
-
         for entry in list(device_entries):
             normalized_identifiers = set(getattr(entry, "identifiers", set()))
             if len(normalized_identifiers) != 1:
@@ -727,7 +1069,6 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             )
         else:
             entity_entries = list(getattr(registry, "entities", {}).values())
-
         for entry in list(entity_entries):
             entity_id = getattr(entry, "entity_id", None)
             unique_id = getattr(entry, "unique_id", None)
@@ -741,24 +1082,82 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         """Get the current state for a device."""
         return self._states.get(device_id, {})
 
+    def is_device_available(self, device_id: str) -> bool:
+        """Return HA-facing availability from device health plus Local transport health.
+
+        A failed device query never poisons hub health, and an HTTP outage never
+        poisons device health.  Entities become unavailable for transport reasons
+        only when *both* MQTT and HTTP/API paths are unavailable.
+        """
+        return self._has_live_transport() and self._availability.is_available(device_id)
+
+    def availability_diagnostics(self) -> dict[str, Any]:
+        """Return compact availability diagnostics."""
+        return self._availability.diagnostics()
+
+    def runtime_diagnostics(self) -> dict[str, Any]:
+        """Return coordinator runtime diagnostics without credentials/secrets."""
+        return {
+            "device_count": len(self._devices),
+            "cached_state_count": len(self._states),
+            "mqtt_configured_host_count": len(self._mqtt_hosts),
+            "mqtt_connected_host_count": len(self._mqtt_clients),
+            "verification_queue_depth": self._verification_queue.qsize(),
+            "verification_devices_queued": len(self._queued_verifications),
+            "hub_api_failure_count": self._hub_health_failures,
+            "hub_api_healthy": self._hub_api_healthy,
+            "mqtt_transport_healthy": bool(self._mqtt_clients),
+            "local_transport_healthy": self._has_live_transport(),
+            "coordinator_last_update_success": self.last_update_success,
+        }
+
+    def _schedule_command_confirmation(
+        self, device_id: str, params: dict[str, Any]
+    ) -> None:
+        """Confirm only the newest command for a device if MQTT stays silent."""
+        previous = self._command_confirmation_tasks.pop(device_id, None)
+        if previous is not None and not previous.done():
+            previous.cancel()
+
+        task = self.hass.async_create_task(
+            self._async_confirm_command(device_id, dict(params))
+        )
+        self._command_confirmation_tasks[device_id] = task
+
+        def _cleanup(done_task: asyncio.Task[Any]) -> None:
+            if self._command_confirmation_tasks.get(device_id) is done_task:
+                self._command_confirmation_tasks.pop(device_id, None)
+
+        task.add_done_callback(_cleanup)
+
+    async def _async_confirm_command(
+        self, device_id: str, params: dict[str, Any]
+    ) -> None:
+        """Queue one read-only confirmation if MQTT did not reflect the command."""
+        await asyncio.sleep(COMMAND_CONFIRM_DELAY)
+        if self._shutdown or device_id not in self._devices:
+            return
+        if self._state_matches_command(self._states.get(device_id, {}), params):
+            return
+        self._queue_verification(
+            device_id,
+            reason="command_confirmation",
+            force=True,
+        )
+
     async def async_send_command(
         self, device_id: str, params: dict[str, Any]
     ) -> dict[str, Any]:
-        """Send a command to a device and refresh its authoritative state."""
+        """Send a command and let MQTT confirm it when possible."""
         device = self._devices.get(device_id)
         if not device:
             raise ValueError(f"Unknown device: {device_id}")
         result = await self._async_send_command_with_transport_recovery(device, params)
-        try:
-            state = await self._async_get_state_with_retry(device)
-            if state is not None:
-                self._update_device_state(device_id, self._normalize_http_state(state))
-        except Exception:
-            _LOGGER.warning(
-                "Failed to refresh state after command for %s",
-                device.name,
-                exc_info=True,
-            )
+
+        # Do not immediately issue getState after every successful command.
+        # Most commands generate MQTT quickly; only fall back to one targeted
+        # read if the cached state still does not match after a short delay.
+        self._schedule_command_confirmation(device_id, params)
         return result
 
 
@@ -775,7 +1174,8 @@ async def create_coordinator(
 ) -> YoLocalCoordinator:
     """Create a coordinator.
 
-    Home Assistant's first coordinator refresh performs setup and initial polling.
+    Home Assistant's first coordinator refresh performs setup and a bounded
+    initial bootstrap.  Ongoing state is MQTT-first with targeted verification.
 
     Raises:
         AuthenticationError: If credentials are invalid.
@@ -794,7 +1194,6 @@ async def create_coordinator(
         await token_manager.get_token()
 
         client = YoLinkClient(host, token_manager, session, http_port, hosts=hosts)
-
         return YoLocalCoordinator(
             hass, client, token_manager, session, config_entry_id, net_id, mqtt_port
         )
