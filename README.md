@@ -65,3 +65,24 @@ This fork builds on the work of David Bruce Borenstein (`borenstein/yolink-local
 ## License
 
 GNU General Public License v3.0. The existing repository `LICENSE` remains authoritative.
+
+## YS5708 / YS5707 local event capture (v0.6.1)
+
+v0.6.1 adds a bounded **RAM-only** diagnostic capture for MQTT events from YS5708-UC switches and YS5707-UC dimmers. It is intended to confirm the exact Local Hub payload for the two auxiliary buttons on the YS5708 before those buttons are exposed as Home Assistant device triggers.
+
+The capture does **not** write a custom log, database, or Recorder entity. It keeps at most 100 matching events in memory and exposes them only through **Download Diagnostics**. The buffer resets when Home Assistant restarts.
+
+### Button-capture test
+
+After installing v0.6.1 and restarting Home Assistant:
+
+1. Press YS5708 **Button 1** normally.
+2. Long-press **Button 1**.
+3. Press **Button 2** normally.
+4. Long-press **Button 2**.
+5. Open **Settings → Devices & services → YoLink Local → Download diagnostics**.
+6. Share the resulting diagnostics file for payload analysis.
+
+The diagnostics section is named `mqtt_event_capture`. Each record contains the device identity/model, MQTT event name, normalized event data, the raw Local Hub payload, and any candidate button fields such as `keyMask` or `pressType`.
+
+Once the payload is confirmed, the intended final implementation is native Home Assistant device automation triggers (for example Button 1 short press / long press and Button 2 short press / long press), not fake HA button entities.

@@ -25,6 +25,7 @@ from .api import (
     YoLinkMQTTClient,
 )
 from .availability import AvailabilityManager
+from .event_capture import DiagnosticEventCapture
 from .const import (
     DEVICE_DISCOVERY_INTERVAL,
     DOMAIN,
@@ -86,6 +87,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self._devices: dict[str, Device] = {}
         self._states: dict[str, dict[str, Any]] = {}
         self._availability = AvailabilityManager()
+        self._diagnostic_event_capture = DiagnosticEventCapture()
 
         self._reconnect_task: asyncio.Task[None] | None = None
         self._discovery_task: asyncio.Task[None] | None = None
@@ -534,6 +536,12 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                 event.event,
             )
             return
+
+        # v0.6.1: keep a bounded RAM-only copy of switch/dimmer events for
+        # reverse-engineering physical auxiliary-button payloads.  Nothing is
+        # written to Recorder or custom storage; Download Diagnostics is the
+        # only supported way to retrieve the capture.
+        self._diagnostic_event_capture.record(device, event)
 
         event_data = event.data if isinstance(event.data, dict) else {}
         raw_online = self._raw_online(event_data)
@@ -1095,6 +1103,10 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         """Return compact availability diagnostics."""
         return self._availability.diagnostics()
 
+    def event_capture_diagnostics(self) -> dict[str, Any]:
+        """Return bounded RAM-only MQTT event capture diagnostics."""
+        return self._diagnostic_event_capture.diagnostics()
+
     def runtime_diagnostics(self) -> dict[str, Any]:
         """Return coordinator runtime diagnostics without credentials/secrets."""
         return {
@@ -1109,6 +1121,9 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             "mqtt_transport_healthy": bool(self._mqtt_clients),
             "local_transport_healthy": self._has_live_transport(),
             "coordinator_last_update_success": self.last_update_success,
+            "diagnostic_event_capture_stored": self._diagnostic_event_capture.diagnostics()[
+                "stored_event_count"
+            ],
         }
 
     def _schedule_command_confirmation(

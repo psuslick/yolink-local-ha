@@ -1,13 +1,17 @@
 {
   "domain": "yolocal",
   "name": "YoLink Local",
-  "codeowners": ["@psuslick"],
+  "codeowners": [
+    "@psuslick"
+  ],
   "config_flow": true,
   "dependencies": [],
   "documentation": "https://github.com/psuslick/yolink-local-ha",
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/psuslick/yolink-local-ha/issues",
-  "requirements": ["paho-mqtt>=2.0.0"],
-  "version": "0.6.0",
+  "requirements": [
+    "paho-mqtt>=2.0.0"
+  ],
+  "version": "0.6.1",
   "icon": "mdi:router-wireless"
 }
