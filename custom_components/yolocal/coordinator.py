@@ -27,6 +27,12 @@ from .api import (
 from .availability import AvailabilityManager
 from .device_events import parse_ys5708_button_event
 from .event_capture import DiagnosticEventCapture
+from .outlet_power import (
+    OutletPowerTracker,
+    power_field,
+    relay_is_on,
+    sanitize_outlet_power_payload,
+)
 from .const import (
     DEVICE_DISCOVERY_INTERVAL,
     DOMAIN,
@@ -90,6 +96,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self._states: dict[str, dict[str, Any]] = {}
         self._availability = AvailabilityManager()
         self._diagnostic_event_capture = DiagnosticEventCapture()
+        self._outlet_power = OutletPowerTracker()
 
         self._reconnect_task: asyncio.Task[None] | None = None
         self._discovery_task: asyncio.Task[None] | None = None
@@ -97,8 +104,9 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self._verification_task: asyncio.Task[None] | None = None
         self._command_confirmation_tasks: dict[str, asyncio.Task[Any]] = {}
 
-        self._verification_queue: asyncio.Queue[tuple[str, str, bool]] = asyncio.Queue()
+        self._verification_queue: asyncio.Queue[str] = asyncio.Queue()
         self._queued_verifications: set[str] = set()
+        self._queued_request_details: dict[str, dict[str, Any]] = {}
         self._device_io_lock = asyncio.Lock()
 
         self._device_registry_listeners: list[DeviceRegistryListener] = []
@@ -135,13 +143,19 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         return self.hass.async_create_task(coro)
 
     def _register_device_health(self, device: Device) -> None:
-        """Ensure availability metadata exists for a discovered device."""
+        """Ensure availability and telemetry metadata exist for a discovered device."""
         self._availability.ensure_device(
             device.device_id,
             name=device.name,
             device_type=device.device_type,
             model=device.model,
         )
+        if device.device_type == "Outlet":
+            self._outlet_power.ensure_device(
+                device.device_id,
+                name=device.name,
+                model=device.model,
+            )
 
     async def _async_setup(self) -> None:
         """Set up the coordinator: fetch devices and start MQTT/background work."""
@@ -230,7 +244,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                     )
                     return device_id, None
 
-                normalized = self._normalize_http_state(state)
+                normalized = self._normalize_http_state(state, device)
                 self._availability.record_http_success(
                     device_id,
                     reported_at=self._reported_at(normalized),
@@ -358,7 +372,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             # reached the device.  Verify before issuing a duplicate command.
             try:
                 state = await self._async_get_state_runtime(device)
-                normalized_state = self._normalize_http_state(state)
+                normalized_state = self._normalize_http_state(state, device)
                 self._availability.record_http_success(
                     device.device_id,
                     reported_at=self._reported_at(normalized_state),
@@ -687,9 +701,16 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         if self._sync_derived_online(device_id):
             self.async_set_updated_data(self._states.copy())
 
-    def _normalize_http_state(self, state: dict[str, Any]) -> dict[str, Any]:
+    def _normalize_http_state(
+        self, state: dict[str, Any], device: Device | None = None
+    ) -> dict[str, Any]:
         """Normalize an HTTP getState payload to the coordinator's canonical shape."""
         normalized_state = self._sanitize_state_payload(state)
+        if device is not None and device.device_type == "Outlet":
+            # Observe the actual incoming sample before merge.  Null/malformed
+            # power must never erase the last valid measurement.
+            self._outlet_power.observe_payload(device.device_id, normalized_state)
+            normalized_state = sanitize_outlet_power_payload(normalized_state)
         if normalized_state.get("reportAt") and "lastReportedAt" not in normalized_state:
             normalized_state["lastReportedAt"] = normalized_state["reportAt"]
         return normalized_state
@@ -712,17 +733,35 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
     ) -> dict[str, Any]:
         """Normalize a flat MQTT event into the nested HTTP-like state shape."""
         normalized: dict[str, Any] = {}
+        source_data = event_data
+
+        if device.device_type == "Outlet":
+            previous_relay_on = relay_is_on(self._states.get(device.device_id, {}))
+            incoming_relay_on = relay_is_on(event_data)
+            had_power_sample = self._outlet_power.observe_payload(
+                device.device_id, event_data
+            )
+            if (
+                incoming_relay_on is True
+                and previous_relay_on is not True
+                and not had_power_sample
+            ):
+                # The prior off-state zero is no longer a current load
+                # measurement.  Let the next health pass request one targeted
+                # serialized getState if MQTT does not provide power first.
+                self._outlet_power.mark_on_without_measurement(device.device_id)
+            source_data = sanitize_outlet_power_payload(event_data)
 
         for key in ("online", "reportAt", "lastReportedAt"):
-            if key in event_data:
-                normalized[key] = event_data[key]
+            if key in source_data:
+                normalized[key] = source_data[key]
         nested_state: dict[str, Any] = {}
-        event_state = event_data.get("state")
+        event_state = source_data.get("state")
         if isinstance(event_state, dict):
             nested_state.update(event_state)
         elif event_state is not None:
             nested_state["state"] = event_state
-        for key, value in event_data.items():
+        for key, value in source_data.items():
             if key in {"state", "online", "reportAt", "lastReportedAt"}:
                 continue
             if (
@@ -852,12 +891,12 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             await self._async_refresh_devices()
 
     async def _async_health_loop(self) -> None:
-        """Evaluate liveness in memory and queue targeted verification when needed."""
+        """Evaluate liveness and telemetry freshness without broad device polling."""
         interval = HEALTH_EVALUATION_INTERVAL.total_seconds()
         while not self._shutdown:
             await asyncio.sleep(interval)
             notify = False
-            for device_id in list(self._devices):
+            for device_id, device in list(self._devices.items()):
                 before_available = self._availability.is_available(device_id)
                 evaluation = self._availability.evaluate(device_id)
                 after_available = self._availability.is_available(device_id)
@@ -869,6 +908,20 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                         device_id,
                         reason=evaluation.reason or "health_check",
                     )
+
+                # YS6614-class outlet power is not guaranteed to be present in
+                # sparse MQTT StatusChange reports.  Refresh only an ON outlet
+                # whose active-power measurement itself is stale/missing.  This
+                # is intentionally separate from device availability and uses
+                # the same serialized I/O worker as health verification.
+                if (
+                    device.device_type == "Outlet"
+                    and self._outlet_power.should_refresh(
+                        device_id,
+                        outlet_is_on=relay_is_on(self._states.get(device_id, {})),
+                    )
+                ):
+                    self._queue_outlet_power_refresh(device_id)
             if notify:
                 self.async_set_updated_data(self._states.copy())
 
@@ -880,38 +933,109 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         reason: str,
         force: bool = False,
     ) -> None:
-        """Queue one verification without allowing duplicate queued requests."""
+        """Queue or upgrade one serialized state request for health verification."""
         if self._shutdown or device_id not in self._devices:
             return
-        if device_id in self._queued_verifications:
+        details = self._queued_request_details.get(device_id)
+        if details is not None:
+            if not details.get("health"):
+                self._availability.note_verification_request(device_id)
+            details["health"] = True
+            details["force"] = bool(details.get("force")) or force
+            details.setdefault("reasons", set()).add(reason)
             return
-        self._queued_verifications.add(device_id)
+
         self._availability.note_verification_request(device_id)
-        self._verification_queue.put_nowait((device_id, reason, force))
+        self._queued_request_details[device_id] = {
+            "health": True,
+            "telemetry": False,
+            "force": force,
+            "reasons": {reason},
+        }
+        self._queued_verifications.add(device_id)
+        self._verification_queue.put_nowait(device_id)
+
+    @callback
+    def _queue_outlet_power_refresh(self, device_id: str) -> None:
+        """Queue one targeted Outlet getState without affecting availability."""
+        if self._shutdown or device_id not in self._devices:
+            return
+        details = self._queued_request_details.get(device_id)
+        if details is not None:
+            details["telemetry"] = True
+            details.setdefault("reasons", set()).add("outlet_power_stale")
+            return
+
+        self._queued_request_details[device_id] = {
+            "health": False,
+            "telemetry": True,
+            "force": False,
+            "reasons": {"outlet_power_stale"},
+        }
+        self._queued_verifications.add(device_id)
+        self._verification_queue.put_nowait(device_id)
 
     async def _async_verification_worker(self) -> None:
-        """Run targeted getState verification serially with jitter."""
+        """Run health/telemetry getState requests serially with de-duplication."""
         while not self._shutdown:
-            device_id, reason, force = await self._verification_queue.get()
+            device_id = await self._verification_queue.get()
+            details = self._queued_request_details.get(device_id) or {
+                "health": True,
+                "telemetry": False,
+                "force": False,
+                "reasons": {"unknown"},
+            }
             try:
                 device = self._devices.get(device_id)
                 if device is None:
                     continue
 
-                if not force and not self._availability.should_verify(device_id):
+                health_requested = bool(details.get("health"))
+                telemetry_requested = bool(details.get("telemetry"))
+                force = bool(details.get("force"))
+                reason = ",".join(sorted(details.get("reasons") or {"unknown"}))
+
+                health_due = health_requested and (
+                    force or self._availability.should_verify(device_id)
+                )
+                telemetry_due = telemetry_requested and (
+                    device.device_type == "Outlet"
+                    and self._outlet_power.should_refresh(
+                        device_id,
+                        outlet_is_on=relay_is_on(self._states.get(device_id, {})),
+                    )
+                )
+                if not health_due and not telemetry_due:
                     continue
 
-                if not force:
+                if health_due and not force:
                     await asyncio.sleep(random.uniform(VERIFY_JITTER_MIN, VERIFY_JITTER_MAX))
-                    # A fresh MQTT report may have arrived while the request was
-                    # queued or during jitter.  Re-check before touching LoRa.
-                    if not self._availability.should_verify(device_id):
+                    # A fresh MQTT report/power sample may have arrived while
+                    # queued or during jitter.  Re-check both reasons before IO.
+                    health_due = self._availability.should_verify(device_id)
+                    telemetry_due = telemetry_requested and (
+                        device.device_type == "Outlet"
+                        and self._outlet_power.should_refresh(
+                            device_id,
+                            outlet_is_on=relay_is_on(self._states.get(device_id, {})),
+                        )
+                    )
+                    if not health_due and not telemetry_due:
                         continue
+
+                if telemetry_due:
+                    self._outlet_power.note_refresh_requested(device_id)
 
                 try:
                     state = await self._async_get_state_runtime(device)
                 except ApiError as err:
-                    if err.code == TRANSIENT_DEVICE_UNREACHABLE:
+                    if telemetry_due:
+                        self._outlet_power.note_refresh_failure(
+                            device_id,
+                            error=f"{err.code}: {err}",
+                            unreachable=err.code == TRANSIENT_DEVICE_UNREACHABLE,
+                        )
+                    if health_due and err.code == TRANSIENT_DEVICE_UNREACHABLE:
                         before_available = self._availability.is_available(device_id)
                         self._availability.record_device_unreachable(
                             device_id,
@@ -929,36 +1053,53 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                             reason,
                             err,
                         )
-                    else:
+                    elif health_due:
                         _LOGGER.warning(
                             "Verification API error for %s (%s): %s",
                             device.name,
                             reason,
                             err,
                         )
+                    else:
+                        _LOGGER.debug(
+                            "Outlet power refresh could not reach %s (%s): %s",
+                            device.name,
+                            reason,
+                            err,
+                        )
                     continue
                 except (aiohttp.ClientError, TimeoutError) as err:
-                    self._availability.record_transport_error(
-                        device_id,
-                        error=str(err),
-                        source="verification_transport",
-                    )
+                    if telemetry_due:
+                        self._outlet_power.note_refresh_failure(
+                            device_id, error=str(err)
+                        )
+                    if health_due:
+                        self._availability.record_transport_error(
+                            device_id,
+                            error=str(err),
+                            source="verification_transport",
+                        )
                     self._mark_hub_api_failure(err)
                     _LOGGER.warning(
-                        "Verification transport error for %s (%s): %s",
+                        "State refresh transport error for %s (%s): %s",
                         device.name,
                         reason,
                         err,
                     )
                     continue
                 except Exception as err:
-                    self._availability.record_transport_error(
-                        device_id,
-                        error=str(err),
-                        source="verification_error",
-                    )
+                    if telemetry_due:
+                        self._outlet_power.note_refresh_failure(
+                            device_id, error=str(err)
+                        )
+                    if health_due:
+                        self._availability.record_transport_error(
+                            device_id,
+                            error=str(err),
+                            source="verification_error",
+                        )
                     _LOGGER.warning(
-                        "Verification failed for %s (%s)",
+                        "State refresh failed for %s (%s)",
                         device.name,
                         reason,
                         exc_info=True,
@@ -966,13 +1107,20 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                     continue
 
                 self._mark_hub_api_available()
-                normalized = self._normalize_http_state(state)
+                normalized = self._normalize_http_state(state, device)
                 self._availability.record_http_success(
                     device_id,
                     reported_at=self._reported_at(normalized),
                     raw_online=self._raw_online(normalized),
-                    source="verification",
+                    source="verification" if health_due else "outlet_power_refresh",
                 )
+                if telemetry_due:
+                    present, valid_power = power_field(normalized)
+                    self._outlet_power.note_refresh_success(
+                        device_id,
+                        had_power_measurement=(present and valid_power is not None)
+                        or relay_is_on(normalized) is False,
+                    )
                 self._update_device_state(
                     device_id,
                     self._merge_state_payload(
@@ -981,6 +1129,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                     ),
                 )
             finally:
+                self._queued_request_details.pop(device_id, None)
                 self._queued_verifications.discard(device_id)
                 self._verification_queue.task_done()
 
@@ -1015,6 +1164,8 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         for device_id in removed_ids:
             self._states.pop(device_id, None)
             self._availability.remove_device(device_id)
+            self._outlet_power.remove_device(device_id)
+            self._queued_request_details.pop(device_id, None)
             self._queued_verifications.discard(device_id)
             self._remove_device_from_registry(device_id)
 
@@ -1024,7 +1175,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         for device in added_devices:
             try:
                 state = await self._async_get_state_runtime(device)
-                normalized = self._normalize_http_state(state)
+                normalized = self._normalize_http_state(state, device)
                 self._availability.record_http_success(
                     device.device_id,
                     reported_at=self._reported_at(normalized),
@@ -1156,6 +1307,10 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         """Return bounded RAM-only MQTT event capture diagnostics."""
         return self._diagnostic_event_capture.diagnostics()
 
+    def outlet_power_diagnostics(self) -> dict[str, Any]:
+        """Return RAM-only Outlet active-power telemetry diagnostics."""
+        return self._outlet_power.diagnostics()
+
     def runtime_diagnostics(self) -> dict[str, Any]:
         """Return coordinator runtime diagnostics without credentials/secrets."""
         return {
@@ -1173,6 +1328,8 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             "diagnostic_event_capture_stored": self._diagnostic_event_capture.diagnostics()[
                 "stored_event_count"
             ],
+            "outlet_power_tracking_count": len(self._outlet_power.diagnostics()),
+            "outlet_power_refresh_queue_shares_device_io_lock": True,
         }
 
     def _schedule_command_confirmation(

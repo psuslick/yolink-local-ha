@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 DEFAULT_EVENT_CAPTURE_LIMIT = 100
-TARGET_MODEL_PREFIXES = ("YS5708", "YS5707")
+TARGET_MODEL_PREFIXES = ("YS5708", "YS5707", "YS6614")
 SENSITIVE_KEY_FRAGMENTS = (
     "token",
     "secret",

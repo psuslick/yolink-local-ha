@@ -36,5 +36,6 @@ async def async_get_config_entry_diagnostics(
         "config_entry": async_redact_data(entry.as_dict(), TO_REDACT),
         "runtime": coordinator.runtime_diagnostics(),
         "availability": coordinator.availability_diagnostics(),
+        "outlet_power": coordinator.outlet_power_diagnostics(),
         "mqtt_event_capture": coordinator.event_capture_diagnostics(),
     }
