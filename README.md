@@ -2,11 +2,22 @@
 
 A Home Assistant custom integration that talks directly to the YoLink Local Hub over the LAN using the Local HTTP API and MQTT. This fork retains the broad device support from `madbrain76/yolink-local-ha` and replaces false-unavailable-prone polling with an MQTT-first availability model.
 
-## v0.7.1 highlights
+
+### v0.7.2 startup/platform recovery
+
+v0.7.2 adds a regression guard ensuring implemented Home Assistant entity
+platforms (including `light`) remain present in `PLATFORMS`. It also closes a
+startup availability gap: a transient `000201` during the initial bootstrap is
+queued for one immediate serialized targeted verification after the bootstrap
+batch instead of waiting for the periodic health loop. Blanket polling is not
+restored.
+
+
+## v0.7.2 highlights
 
 ### YS6614 active-power telemetry
 
-v0.7.1 fixes a telemetry gap exposed after the v0.6 MQTT-first redesign. YoLink Outlet MQTT `StatusChange` reports can be sparse and may carry relay state without an instantaneous `power` sample. The old five-minute all-device HTTP sweep incidentally refreshed power, while the redesigned integration correctly removed that sweep to eliminate false-unavailable clusters. As a result, an Outlet whose startup `getState` missed or whose later payload carried a null/malformed `power` could leave the Home Assistant power sensor unknown/stale even though the outlet itself remained healthy.
+v0.7.2 fixes a telemetry gap exposed after the v0.6 MQTT-first redesign. YoLink Outlet MQTT `StatusChange` reports can be sparse and may carry relay state without an instantaneous `power` sample. The old five-minute all-device HTTP sweep incidentally refreshed power, while the redesigned integration correctly removed that sweep to eliminate false-unavailable clusters. As a result, an Outlet whose startup `getState` missed or whose later payload carried a null/malformed `power` could leave the Home Assistant power sensor unknown/stale even though the outlet itself remained healthy.
 
 The fix keeps the MQTT-first availability design and adds a narrow telemetry path instead of restoring broad polling:
 
@@ -39,7 +50,7 @@ The Local Hub reports these as `Switch.DevEvent` with `keyMask` 1/2 and `type` `
 
 YoLink `Dimmer` devices are exposed as native Home Assistant `light` entities with on/off and brightness control. Local Hub brightness is 0–100 and is translated to Home Assistant's 0–255 brightness scale.
 
-See `RELEASE_NOTES_v0.7.1.md` for the power fix and `RELEASE_NOTES_v0.7.0.md` for the YS5708/YS5707 feature release.
+See `RELEASE_NOTES_v0.7.2.md` for the power fix and `RELEASE_NOTES_v0.7.0.md` for the YS5708/YS5707 feature release.
 
 ## Reliability model
 
@@ -70,7 +81,7 @@ Existing integration domain `yolocal` and device identifiers are unchanged.
 4. Restart Home Assistant.
 5. If the integration was already configured, keep the existing config entry; do not delete and recreate it.
 
-For reliable update detection, publish a GitHub Release matching `custom_components/yolocal/manifest.json` (for this release, `v0.7.1`).
+For reliable update detection, publish a GitHub Release matching `custom_components/yolocal/manifest.json` (for this release, `v0.7.2`).
 
 ## Configuration prerequisites
 

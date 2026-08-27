@@ -190,7 +190,10 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         The old implementation queried every device concurrently every five
         minutes.  This method now runs as the coordinator's startup bootstrap
         and only queries devices that lack state.  Bootstrap concurrency is
-        deliberately bounded to two requests and each device gets one attempt.
+        deliberately bounded.  A transient device-specific bootstrap failure is
+        queued for one serialized targeted verification immediately after the
+        bootstrap batch completes, rather than leaving the entity unavailable
+        until the periodic health loop runs.
         """
         missing = [
             (device_id, device)
@@ -204,7 +207,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
 
         async def fetch_one(
             device_id: str, device: Device
-        ) -> tuple[str, dict[str, Any] | None]:
+        ) -> tuple[str, dict[str, Any] | None, bool]:
             async with semaphore:
                 try:
                     async with asyncio.timeout(DEVICE_IO_TIMEOUT):
@@ -222,27 +225,27 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                             device.name,
                             err,
                         )
-                        return device_id, None
+                        return device_id, None, True
                     _LOGGER.warning(
                         "Failed to get initial state for %s: %s",
                         device.name,
                         err,
                     )
-                    return device_id, None
+                    return device_id, None, False
                 except (aiohttp.ClientError, TimeoutError) as err:
                     _LOGGER.warning(
                         "Transport failure getting initial state for %s: %s",
                         device.name,
                         err,
                     )
-                    return device_id, None
+                    return device_id, None, False
                 except Exception:
                     _LOGGER.warning(
                         "Failed to get initial state for %s",
                         device.name,
                         exc_info=True,
                     )
-                    return device_id, None
+                    return device_id, None, False
 
                 normalized = self._normalize_http_state(state, device)
                 self._availability.record_http_success(
@@ -251,12 +254,15 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                     raw_online=self._raw_online(normalized),
                     source="bootstrap",
                 )
-                return device_id, normalized
+                return device_id, normalized, False
 
         results = await asyncio.gather(*(fetch_one(*item) for item in missing))
         refreshed_states = self._states.copy()
-        for device_id, incoming_state in results:
+        bootstrap_retry_ids: list[str] = []
+        for device_id, incoming_state, retry_transient in results:
             if incoming_state is None:
+                if retry_transient:
+                    bootstrap_retry_ids.append(device_id)
                 continue
             refreshed_states[device_id] = self._with_derived_online(
                 device_id,
@@ -267,6 +273,17 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             )
 
         self._states = refreshed_states
+
+        # One transient startup 000201 should not leave an entity waiting for
+        # the periodic health loop. Queue one forced targeted read after the
+        # bootstrap batch so the existing worker can serialize it safely.
+        for device_id in bootstrap_retry_ids:
+            self._queue_verification(
+                device_id,
+                reason="bootstrap_transient_retry",
+                force=True,
+            )
+
         return refreshed_states.copy()
 
     async def _fetch_all_states(self) -> None:
