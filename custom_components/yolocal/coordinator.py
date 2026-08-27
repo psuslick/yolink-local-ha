@@ -25,11 +25,13 @@ from .api import (
     YoLinkMQTTClient,
 )
 from .availability import AvailabilityManager
+from .device_events import parse_ys5708_button_event
 from .event_capture import DiagnosticEventCapture
 from .const import (
     DEVICE_DISCOVERY_INTERVAL,
     DOMAIN,
     HEALTH_EVALUATION_INTERVAL,
+    YOLINK_EVENT,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -537,11 +539,11 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             )
             return
 
-        # v0.6.1: keep a bounded RAM-only copy of switch/dimmer events for
-        # reverse-engineering physical auxiliary-button payloads.  Nothing is
-        # written to Recorder or custom storage; Download Diagnostics is the
-        # only supported way to retrieve the capture.
+        # Keep a bounded RAM-only copy of relevant switch/dimmer/button-like events.
+        # YS5708 button semantics are now validated and functional; retaining this
+        # capture helps diagnose future device models without custom disk logging.
         self._diagnostic_event_capture.record(device, event)
+        self._fire_local_device_event(device, event)
 
         event_data = event.data if isinstance(event.data, dict) else {}
         raw_online = self._raw_online(event_data)
@@ -578,6 +580,53 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                 normalized_event,
             ),
         )
+
+    @callback
+    def _fire_local_device_event(self, device: Device, event: DeviceEvent) -> None:
+        """Fire a compact HA event for physical Local Hub device events.
+
+        ``Switch.DevEvent`` is distinct from relay/state messages such as
+        ``Switch.StatusChange`` and ``Switch.setState``.  The validated YS5708
+        payload is translated into stable device-trigger types while the generic
+        event still carries enough context for advanced automations.
+        """
+        if not str(event.event or "").endswith(".DevEvent"):
+            return
+
+        registry = dr.async_get(self.hass)
+        registry_device = registry.async_get_device(
+            identifiers={(DOMAIN, device.device_id)}
+        )
+        if registry_device is None:
+            return
+
+        event_data = event.data if isinstance(event.data, dict) else {}
+        parsed = parse_ys5708_button_event(
+            model=device.model,
+            event_name=event.event,
+            event_data=event_data,
+        )
+
+        bus_data: dict[str, Any] = {
+            "device_id": registry_device.id,
+            "source_device_id": device.device_id,
+            "device_name": device.name,
+            "device_type": device.device_type,
+            "model": device.model,
+            "event_name": event.event,
+            "type": parsed.trigger_type if parsed else "device_event",
+            "event_data": event_data,
+        }
+        if parsed is not None:
+            bus_data.update(
+                {
+                    "button": parsed.button,
+                    "key_mask": parsed.button,
+                    "press_type": parsed.press_type,
+                }
+            )
+
+        self.hass.bus.async_fire(YOLINK_EVENT, bus_data)
 
     def _is_duplicate_mqtt_event(self, event: DeviceEvent) -> bool:
         """Return True when the same MQTT event was recently processed."""

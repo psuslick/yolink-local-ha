@@ -72,7 +72,7 @@ def extract_button_candidates(value: Any, path: str = "") -> list[dict[str, Any]
 
 
 class DiagnosticEventCapture:
-    """Keep a small, RAM-only event history for switch/dimmer reverse engineering."""
+    """Keep a small RAM-only event history for protocol/device diagnostics."""
 
     def __init__(self, limit: int = DEFAULT_EVENT_CAPTURE_LIMIT) -> None:
         self._events: deque[dict[str, Any]] = deque(maxlen=limit)

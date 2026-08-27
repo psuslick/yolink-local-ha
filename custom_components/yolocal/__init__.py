@@ -47,7 +47,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     host = entry.data[CONF_HUB_IP]
     hosts = _configured_hosts(entry)
     coordinator: YoLocalCoordinator | None = None
-
     try:
         coordinator = await create_coordinator(
             hass=hass,
@@ -91,7 +90,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.config_entries.async_update_entry(entry, **update_kwargs)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-
     return True
 
 

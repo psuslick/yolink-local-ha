@@ -12,6 +12,5 @@
   "requirements": [
     "paho-mqtt>=2.0.0"
   ],
-  "version": "0.6.1",
-  "icon": "mdi:router-wireless"
+  "version": "0.7.0"
 }

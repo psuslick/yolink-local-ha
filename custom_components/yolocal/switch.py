@@ -10,7 +10,8 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .coordinator import YoLocalCoordinator
-from .entity import async_setup_device_entities, YoLocalEntity
+from .device_events import is_ys5708_model
+from .entity import YoLocalEntity, async_setup_device_entities
 
 
 async def async_setup_entry(
@@ -19,22 +20,32 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up YoLink switches from a config entry."""
+
     def build_entities(
         coordinator: YoLocalCoordinator,
         device,
     ) -> list[YoLocalSwitch]:
-        if device.device_type != "Outlet":
-            return []
-        return [YoLocalSwitch(coordinator, device)]
+        if device.device_type == "Outlet":
+            return [YoLocalSwitch(coordinator, device)]
+        if device.device_type == "Switch" and is_ys5708_model(device.model):
+            return [YoLocalSwitch(coordinator, device)]
+        return []
 
     await async_setup_device_entities(hass, entry, async_add_entities, build_entities)
 
 
 class YoLocalSwitch(YoLocalEntity, SwitchEntity):
-    """Switch entity for YoLink outlet."""
+    """Switch entity for YoLink outlets and in-wall switches."""
 
-    _attr_device_class = SwitchDeviceClass.OUTLET
     _attr_name = None  # Use device name
+
+    def __init__(self, coordinator: YoLocalCoordinator, device) -> None:
+        super().__init__(coordinator, device)
+        self._attr_device_class = (
+            SwitchDeviceClass.OUTLET
+            if device.device_type == "Outlet"
+            else SwitchDeviceClass.SWITCH
+        )
 
     @property
     def is_on(self) -> bool | None:
@@ -44,7 +55,7 @@ class YoLocalSwitch(YoLocalEntity, SwitchEntity):
             state = state.get("state")
         if state is None:
             return None
-        # YoLink uses "open" for on, "closed" for off (relay terminology)
+        # YoLink uses "open" for on, "closed" for off (relay terminology).
         return state == "open"
 
     async def async_turn_on(self, **kwargs: Any) -> None:

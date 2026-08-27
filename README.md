@@ -1,28 +1,48 @@
 # YoLink Local
 
-A Home Assistant custom integration that talks directly to the YoLink Local Hub over the LAN using the Local HTTP API and MQTT. This fork retains the device support and dual-host work from `madbrain76/yolink-local-ha` and changes the availability architecture to avoid false `unavailable` states caused by transient synchronous device-query failures.
+A Home Assistant custom integration that talks directly to the YoLink Local Hub over the LAN using the Local HTTP API and MQTT. This fork retains the broad device support from `madbrain76/yolink-local-ha` and replaces false-unavailable-prone polling with an MQTT-first availability model.
 
-## v0.6.0 reliability model
+## v0.7.0 highlights
+
+### YS5708-UC in-wall switches
+
+YS5708 devices are now exposed as native Home Assistant `switch` entities. The two auxiliary physical buttons are also exposed as native **device automation triggers** based on payloads confirmed from a real Local Hub:
+
+- Button 1 short press
+- Button 1 long press
+- Button 2 short press
+- Button 2 long press
+
+The Local Hub reports these as `Switch.DevEvent` with `keyMask` 1/2 and `type` `Press`/`LongPress`. The integration also fires a compact `yolocal_event` event on the HA event bus for `*.DevEvent` messages so advanced automations can use the raw device-event context without creating fake button entities.
+
+### YS5707-UC dimmer
+
+YoLink `Dimmer` devices are exposed as native Home Assistant `light` entities with on/off and brightness control. Local Hub brightness is 0–100 and is translated to Home Assistant's 0–255 brightness scale.
+
+See `RELEASE_NOTES_v0.7.0.md` for details.
+
+## Reliability model
 
 The normal state path is **MQTT-first**. There is no repeating five-minute `getState` request to every device. HTTP `getState` is reserved for startup bootstrap, newly discovered devices, stale/suspect verification, ambiguous command recovery, and command confirmation when MQTT does not arrive.
 
-A YoLink `000201` / “Cannot connect to the device” response means that one synchronous hub-to-device request failed. It does **not** immediately make the Home Assistant device unavailable. Internally a device can be `available`, `suspect`, or `unavailable`; `suspect` remains usable in HA. A device becomes unavailable only after its liveness is stale and three spaced device-specific verification attempts have returned `000201`.
+A YoLink `000201` / “Cannot connect to the device” response means that one synchronous hub-to-device request failed. It does **not** immediately make the Home Assistant device unavailable. Internally a device can be `available`, `suspect`, or `unavailable`; `suspect` remains usable in HA. A device becomes unavailable only after its liveness is stale and multiple spaced device-specific verification attempts fail.
 
-Any valid, non-duplicate MQTT report or successful `getState` immediately restores availability. A successful `getState` counts as positive liveness even if the hub response omits a raw `online` field.
+Any valid, non-duplicate MQTT report or successful `getState` immediately restores availability. A successful `getState` counts as positive liveness even if the Hub response omits a raw `online` field.
 
 For normally line-powered device types (`Outlet`, `Switch`, `Dimmer`, `MultiOutlet`), the integration can learn a stable MQTT cadence and choose an adaptive stale threshold, bounded between 30 minutes and 12 hours. Battery/event-driven devices use the conservative 12-hour threshold by default.
 
-HTTP/API transport health, MQTT transport health, device health, and command failures are tracked separately. If one Local transport path fails while the other remains usable, device availability is not poisoned by the failed path.
-
-See `RELEASE_NOTES_v0.6.0.md` for the full change list.
+HTTP/API transport health, MQTT transport health, device health, and command failures are tracked separately.
 
 ## Tested / inherited device support
 
-The fork preserves the existing platform/device support from the v0.5.6 base, including DoorSensor, LeakSensor, Manipulator, MotionSensor, Outlet/YS6614, TempSensor, THSensor, TiltSensor, locks, switches, sirens, and valves supported by the upstream codebase. Existing entity unique IDs and the integration domain `yolocal` are unchanged.
+The fork preserves existing platform/device support from the v0.5.6 base, including DoorSensor, LeakSensor, Manipulator, MotionSensor, Outlet/YS6614, TempSensor, THSensor, TiltSensor, locks, sirens, and valves. v0.7.0 additionally validates:
+
+- **YS5708-UC** — local switch control plus four auxiliary-button triggers;
+- **YS5707-UC** — local light on/off and brightness.
+
+Existing integration domain `yolocal` and device identifiers are unchanged.
 
 ## HACS installation
-
-This repository is intended to be installed as a HACS custom integration.
 
 1. In HACS, open **Custom repositories**.
 2. Add `https://github.com/psuslick/yolink-local-ha` as category **Integration**.
@@ -30,33 +50,32 @@ This repository is intended to be installed as a HACS custom integration.
 4. Restart Home Assistant.
 5. If the integration was already configured, keep the existing config entry; do not delete and recreate it.
 
-For reliable HACS update detection, publish/tag the repository version that matches `custom_components/yolocal/manifest.json` (for this release, `v0.6.0`).
+For reliable update detection, publish a GitHub Release matching `custom_components/yolocal/manifest.json` (for this release, `v0.7.0`).
 
 ## Configuration prerequisites
 
 - YoLink Local Hub with the relevant devices migrated to the Local Network.
-- HTTP and MQTT enabled on the hub.
+- HTTP and MQTT enabled on the Hub.
 - Hub host/IP, Local API Client ID, Client Secret, and Net ID from the YoLink app.
 - Optional secondary host/IP may be configured for the same physical Local Hub.
 
+## YS5708 automation triggers
+
+In the Home Assistant automation UI, choose **Device** as the trigger and select the local YS5708 device. The four physical-button trigger choices should appear directly.
+
+For advanced event-bus use, listen for `yolocal_event`. Recognized YS5708 button events contain fields including `device_id`, `source_device_id`, `type`, `button`, `key_mask`, `press_type`, `model`, and `event_name`.
+
 ## Diagnostics
 
-Home Assistant **Download diagnostics** for the YoLink Local config entry now includes redacted configuration plus compact runtime and per-device availability data, including:
-
-- current internal availability status and reason;
-- last MQTT / successful HTTP liveness;
-- liveness age;
-- adaptive stale threshold and its source;
-- `000201` failure count;
-- verification request/success/unreachable counters;
-- last error code/source;
-- MQTT and HTTP/API transport health.
-
-Credentials and configured hub addresses are redacted from the config-entry portion of diagnostics.
+Home Assistant **Download diagnostics** includes redacted configuration plus compact runtime/per-device availability information. The bounded RAM-only MQTT event capture remains available for future protocol/device investigation. It does not create a custom log, database, or Recorder entity and resets on Home Assistant restart.
 
 ## Storage / write behavior
 
-The availability and learned-cadence state is kept in memory. This integration does not add a custom database, event journal, or high-frequency file logger. Normal Home Assistant Recorder behavior still applies to entity state changes.
+Availability, learned cadence, and MQTT event capture state are kept in memory. This integration does not add a custom database, persistent event journal, or high-frequency file logger. Normal Home Assistant Recorder behavior still applies to entity state changes.
+
+## Repository validation
+
+See `REPOSITORY_SETTINGS.md` for HACS requirements that live in GitHub repository settings rather than files (notably Issues and repository topics).
 
 ## Credits
 
@@ -65,24 +84,3 @@ This fork builds on the work of David Bruce Borenstein (`borenstein/yolink-local
 ## License
 
 GNU General Public License v3.0. The existing repository `LICENSE` remains authoritative.
-
-## YS5708 / YS5707 local event capture (v0.6.1)
-
-v0.6.1 adds a bounded **RAM-only** diagnostic capture for MQTT events from YS5708-UC switches and YS5707-UC dimmers. It is intended to confirm the exact Local Hub payload for the two auxiliary buttons on the YS5708 before those buttons are exposed as Home Assistant device triggers.
-
-The capture does **not** write a custom log, database, or Recorder entity. It keeps at most 100 matching events in memory and exposes them only through **Download Diagnostics**. The buffer resets when Home Assistant restarts.
-
-### Button-capture test
-
-After installing v0.6.1 and restarting Home Assistant:
-
-1. Press YS5708 **Button 1** normally.
-2. Long-press **Button 1**.
-3. Press **Button 2** normally.
-4. Long-press **Button 2**.
-5. Open **Settings → Devices & services → YoLink Local → Download diagnostics**.
-6. Share the resulting diagnostics file for payload analysis.
-
-The diagnostics section is named `mqtt_event_capture`. Each record contains the device identity/model, MQTT event name, normalized event data, the raw Local Hub payload, and any candidate button fields such as `keyMask` or `pressType`.
-
-Once the payload is confirmed, the intended final implementation is native Home Assistant device automation triggers (for example Button 1 short press / long press and Button 2 short press / long press), not fake HA button entities.

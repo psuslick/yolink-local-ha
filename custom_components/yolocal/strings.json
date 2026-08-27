@@ -39,5 +39,13 @@
     "abort": {
       "already_configured": "This hub is already configured"
     }
+  },
+  "device_automation": {
+    "trigger_type": {
+      "button_1_short_press": "Button 1 short press",
+      "button_1_long_press": "Button 1 long press",
+      "button_2_short_press": "Button 2 short press",
+      "button_2_long_press": "Button 2 long press"
+    }
   }
 }
