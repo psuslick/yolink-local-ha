@@ -1,5 +1,11 @@
 # YoLink Local
 
+### v0.7.4 device-name diagnostics
+
+v0.7.4 adds a read-only `device_names` diagnostics section showing the Local Hub
+API name and Home Assistant registry name side-by-side for every YoLink device.
+
+
 ### v0.7.3 device-name synchronization
 
 v0.7.3 synchronizes integration-provided Home Assistant device names with the current
@@ -88,7 +94,7 @@ Existing integration domain `yolocal` and device identifiers are unchanged.
 4. Restart Home Assistant.
 5. If the integration was already configured, keep the existing config entry; do not delete and recreate it.
 
-For reliable update detection, publish a GitHub Release matching `custom_components/yolocal/manifest.json` (for this release, `v0.7.3`).
+For reliable update detection, publish a GitHub Release matching `custom_components/yolocal/manifest.json` (for this release, `v0.7.4`).
 
 ## Configuration prerequisites
 
