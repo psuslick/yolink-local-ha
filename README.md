@@ -1,5 +1,12 @@
 # YoLink Local
 
+### v0.7.3 device-name synchronization
+
+v0.7.3 synchronizes integration-provided Home Assistant device names with the current
+name reported by the YoLink Local Hub. Existing entity objects are refreshed in place;
+Home Assistant user name overrides and entity IDs are left untouched.
+
+
 A Home Assistant custom integration that talks directly to the YoLink Local Hub over the LAN using the Local HTTP API and MQTT. This fork retains the broad device support from `madbrain76/yolink-local-ha` and replaces false-unavailable-prone polling with an MQTT-first availability model.
 
 
@@ -81,7 +88,7 @@ Existing integration domain `yolocal` and device identifiers are unchanged.
 4. Restart Home Assistant.
 5. If the integration was already configured, keep the existing config entry; do not delete and recreate it.
 
-For reliable update detection, publish a GitHub Release matching `custom_components/yolocal/manifest.json` (for this release, `v0.7.2`).
+For reliable update detection, publish a GitHub Release matching `custom_components/yolocal/manifest.json` (for this release, `v0.7.3`).
 
 ## Configuration prerequisites
 

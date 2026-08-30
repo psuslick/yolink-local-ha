@@ -157,12 +157,42 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                 model=device.model,
             )
 
+    @staticmethod
+    def _refresh_device_metadata(existing: Device, incoming: Device) -> bool:
+        """Refresh Local Hub metadata in place while preserving entity references."""
+        if existing == incoming:
+            return False
+
+        existing.name = incoming.name
+        existing.token = incoming.token
+        existing.device_type = incoming.device_type
+        existing.display_type = incoming.display_type
+        existing.model = incoming.model
+        return True
+
+    def _sync_device_registry_name(self, device: Device) -> bool:
+        """Sync the integration-provided HA device name from the Local Hub."""
+        registry = dr.async_get(self.hass)
+        device_entry = registry.async_get_device(
+            identifiers={(DOMAIN, device.device_id)}
+        )
+        if device_entry is None or device_entry.name == device.name:
+            return False
+
+        # Updating DeviceEntry.name does not overwrite name_by_user, so explicit
+        # Home Assistant user renames remain intact.
+        registry.async_update_device(device_entry.id, name=device.name)
+        return True
+
     async def _async_setup(self) -> None:
         """Set up the coordinator: fetch devices and start MQTT/background work."""
         devices = await self._client.get_devices()
         self._devices = {d.device_id: d for d in devices}
         for device in devices:
             self._register_device_health(device)
+            # Existing HA device-registry entries survive integration reloads.
+            # Refresh their integration-provided names from the Local Hub.
+            self._sync_device_registry_name(device)
         self._remove_stale_registry_devices(set(self._devices))
 
         # MQTT connects in the background exactly as in the upstream fork so HA
@@ -1151,7 +1181,7 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                 self._verification_queue.task_done()
 
     async def _async_refresh_devices(self) -> bool:
-        """Refresh the device registry and notify listeners if membership changed."""
+        """Refresh Local Hub devices, including metadata changes such as renames."""
         try:
             devices = await self._client.get_devices()
         except Exception as err:
@@ -1163,19 +1193,54 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         for device in devices:
             self._register_device_health(device)
 
-        if set(new_devices) == set(self._devices):
+        existing_device_ids = set(self._devices)
+        new_device_ids = set(new_devices)
+        added_ids = sorted(new_device_ids - existing_device_ids)
+        removed_ids = sorted(existing_device_ids - new_device_ids)
+        common_ids = sorted(existing_device_ids & new_device_ids)
+
+        metadata_changed_ids: list[str] = []
+        registry_name_changed_ids: list[str] = []
+
+        # Existing YoLocalEntity objects retain their Device reference. Update
+        # those Device objects in place so a Local Hub rename is reflected by
+        # every associated entity without recreating entities or changing IDs.
+        for device_id in common_ids:
+            existing = self._devices[device_id]
+            incoming = new_devices[device_id]
+            old_name = existing.name
+
+            if self._refresh_device_metadata(existing, incoming):
+                metadata_changed_ids.append(device_id)
+                if old_name != existing.name:
+                    _LOGGER.info(
+                        "YoLink device renamed: %s: %r -> %r",
+                        device_id,
+                        old_name,
+                        existing.name,
+                    )
+
+            # Keep object identity stable for entities already created by HA.
+            new_devices[device_id] = existing
+
+            if self._sync_device_registry_name(existing):
+                registry_name_changed_ids.append(device_id)
+
+        added_devices = [new_devices[device_id] for device_id in added_ids]
+        removed_devices = [self._devices[device_id] for device_id in removed_ids]
+        changed_ids = sorted(
+            set(metadata_changed_ids) | set(registry_name_changed_ids)
+        )
+
+        if not added_ids and not removed_ids and not changed_ids:
             self._devices = new_devices
             return False
 
-        existing_device_ids = set(self._devices)
-        added_ids = sorted(set(new_devices) - existing_device_ids)
-        removed_ids = sorted(existing_device_ids - set(new_devices))
-        added_devices = [new_devices[device_id] for device_id in added_ids]
-        removed_devices = [self._devices[device_id] for device_id in removed_ids]
         _LOGGER.info(
-            "Device registry changed; added=%s removed=%s.",
+            "Device registry changed; added=%s removed=%s updated=%s.",
             added_ids,
             removed_ids,
+            changed_ids,
         )
         self._devices = new_devices
         for device_id in removed_ids:
@@ -1223,11 +1288,14 @@ class YoLocalCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                 _LOGGER.warning("Failed to get initial state for %s", device.name)
                 self._states[device.device_id] = {}
 
-        for listener in list(self._device_registry_listeners):
-            try:
-                listener(added_devices, removed_devices)
-            except Exception:
-                _LOGGER.exception("Device registry listener failed")
+        # Platform listeners only need membership changes. Metadata-only changes
+        # are already applied in place and must not recreate entities.
+        if added_devices or removed_devices:
+            for listener in list(self._device_registry_listeners):
+                try:
+                    listener(added_devices, removed_devices)
+                except Exception:
+                    _LOGGER.exception("Device registry listener failed")
 
         self.async_set_updated_data(self._states.copy())
         return True
